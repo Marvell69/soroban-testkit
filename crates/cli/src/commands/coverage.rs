@@ -78,12 +78,23 @@ pub fn run(args: CoverageArgs) -> Result<(), CliError> {
     })?;
 
     if !status.success() {
-        return Err(CliError(format!(
-            "coverage run failed (cargo llvm-cov exited with {status})"
-        )));
+        return Err(CliError(coverage_failure_message(status)));
     }
 
     Ok(())
+}
+
+fn coverage_failure_message(status: std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        if let Some(signal) = status.signal() {
+            return format!("coverage run terminated by signal {signal}");
+        }
+    }
+
+    format!("coverage run failed (cargo llvm-cov exited with {status})")
 }
 
 /// Builds the `cargo llvm-cov` invocation for `args`, without running it —
@@ -139,6 +150,11 @@ fn build_command(args: &CoverageArgs) -> Result<Command, CliError> {
     }
 
     if let Some(pct) = args.fail_under {
+        if !pct.is_finite() || !(0.0..=100.0).contains(&pct) {
+            return Err(CliError(format!(
+                "--fail-under must be between 0 and 100 (got {pct})"
+            )));
+        }
         cmd.arg("--fail-under-lines").arg(pct.to_string());
     }
 
@@ -247,6 +263,25 @@ mod tests {
                 "90",
             ]
         );
+    }
+
+    #[test]
+    fn fail_under_must_be_between_zero_and_one_hundred() {
+        for pct in [-0.1, 100.1, f64::NAN, f64::INFINITY] {
+            let mut a = args(&[], &[]);
+            a.fail_under = Some(pct);
+            let err = build_command(&a).unwrap_err();
+            assert!(err.0.contains("between 0 and 100"), "{}", err.0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_termination_is_reported_distinctly() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let message = coverage_failure_message(std::process::ExitStatus::from_raw(9));
+        assert_eq!(message, "coverage run terminated by signal 9");
     }
 
     #[test]
