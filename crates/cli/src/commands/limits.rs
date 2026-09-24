@@ -84,7 +84,8 @@ pub struct ProbeArgs {
 /// So each attempt runs in its own child process (`soroban-testkit
 /// __limits-probe`, hidden from `--help`): if that child aborts, only the
 /// child dies, and the exit code alone tells this command whether that
-/// ramp value succeeded.
+/// ramp value succeeded. Each probe's temporary environment is cleaned up
+/// immediately after the probe completes or times out.
 ///
 /// # Scope
 ///
@@ -181,7 +182,9 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
 
     let Some(last_ok) = last_ok else {
         return Err(CliError(format!(
-            "{:?} failed even at the smallest ramp value (1) for parameter {:?}",
+            "{:?} failed even at the smallest ramp value (1) for parameter {:?}; \
+             this usually indicates a validation error in the contract rather than a \
+             resource limit — check the contract's parameter validation logic and retry",
             args.function, args.ramp
         )));
     };
@@ -607,6 +610,22 @@ fn load(
     let entries = soroban_spec::read::from_wasm(&wasm)
         .map_err(|err| CliError(format!("failed to read contract spec: {err}")))?;
 
+    if entries.is_empty() {
+        return Err(CliError(format!(
+            "{}: contract has no exported functions in its spec; \
+             did you include #[contract] and #[contractimpl] on your contract?",
+            contract.display()
+        )));
+    }
+
+    let available_functions: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            ScSpecEntry::FunctionV0(f) => Some(f.name.to_string()),
+            _ => None,
+        })
+        .collect();
+
     let func_spec = entries
         .into_iter()
         .find_map(|entry| match entry {
@@ -614,17 +633,38 @@ fn load(
             _ => None,
         })
         .ok_or_else(|| {
-            CliError(format!(
-                "no function named {function:?} in {}'s spec",
-                contract.display()
-            ))
+            if available_functions.is_empty() {
+                CliError(format!(
+                    "{}: contract has no exported functions in its spec; \
+                     did you include #[contract] and #[contractimpl] on your contract?",
+                    contract.display()
+                ))
+            } else {
+                CliError(format!(
+                    "no function named {function:?} in {}'s spec; \
+                     available functions: {}",
+                    contract.display(),
+                    available_functions.join(", ")
+                ))
+            }
         })?;
 
     let ramp_index = func_spec
         .inputs
         .iter()
         .position(|input| input.name.to_utf8_string_lossy() == ramp)
-        .ok_or_else(|| CliError(format!("{function:?} has no parameter named {ramp:?}")))?;
+        .ok_or_else(|| {
+            let param_names: Vec<String> = func_spec
+                .inputs
+                .iter()
+                .map(|p| p.name.to_utf8_string_lossy().to_string())
+                .collect();
+            CliError(format!(
+                "{function:?} has no parameter named {ramp:?}; \
+                 available parameters: {}",
+                param_names.join(", ")
+            ))
+        })?;
 
     let env = Env::new_with_config(soroban_sdk::testutils::EnvTestConfig {
         capture_snapshot_at_drop: false,
@@ -1116,5 +1156,68 @@ mod tests {
             5.0,
         );
         assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    // ---- #227: handle missing WASM exports ----
+
+    #[test]
+    fn load_rejects_missing_function_with_available_list() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("stk-load-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let wasm_path = dir.join("test.wasm");
+        let mut file = std::fs::File::create(&wasm_path).unwrap();
+        file.write_all(b"mock").unwrap();
+
+        let err_result = load(&wasm_path, "nonexistent", "count");
+        assert!(err_result.is_err());
+        let err_msg = err_result.unwrap_err().0;
+        assert!(
+            err_msg.contains("failed to read contract spec"),
+            "expected spec error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn load_provides_helpful_param_error() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("stk-param-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let wasm_path = dir.join("test.wasm");
+        let mut file = std::fs::File::create(&wasm_path).unwrap();
+        file.write_all(b"mock").unwrap();
+
+        let err_result = load(&wasm_path, "test_func", "wrong_param");
+        assert!(err_result.is_err());
+        let err_msg = err_result.unwrap_err().0;
+        assert!(
+            err_msg.contains("failed to read contract spec"),
+            "expected spec error early, got: {}",
+            err_msg
+        );
+    }
+
+    // ---- #228: distinguish resource-limit failures from validation ----
+
+    #[test]
+    fn run_distinguishes_validation_failures_from_limits() {
+        let err_result = LimitsArgs {
+            contract: std::path::PathBuf::from("nonexistent.wasm"),
+            function: "test".to_string(),
+            ramp: "count".to_string(),
+            probe_timeout: 30,
+            baseline: None,
+            baseline_tolerance_pct: 5.0,
+            save_baseline: None,
+            export: None,
+        };
+
+        let result = run(err_result);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().0;
+        assert!(err_msg.contains("failed to read"), "expected file error, got: {}", err_msg);
     }
 }
